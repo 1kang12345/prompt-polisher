@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-prompt-polisher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Rewrite rough composer prompts into structured variants, with a before/after diff and one-click replace.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

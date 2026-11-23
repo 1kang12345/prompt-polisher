@@ -5,6 +5,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const ROUTE = '/dsh-prompt-polisher/rewrite'
+    const VERIFY_ROUTE = '/dsh-prompt-polisher/verify'
     const AUTO_KEY = 'dsh-prompt-polisher.auto'
     const AUTO_DELAY_MS = 1200
     const MIN_DRAFT_CHARS = 4
@@ -19,9 +20,13 @@ window.__ModuleLoader__.load({
         contextMode: '结合当前对话',
         fastMode: '快速改写',
         rewriting: '正在改写…',
-        contextStatus: (n) => `已参考最近 ${n} 轮`,
+        contextStatus: (n, truncated) => truncated ? `已参考最近 ${n} 轮（部分截断）` : `已参考最近 ${n} 轮`,
         contextEmpty: '当前仅依据草稿',
         contextUnavailable: '会话不可读取，已退回纯草稿',
+        staleVersion: '对话已经变化（可能被回滚或切换了分支），下面是旧版本的结果。',
+        verifyFailed: '无法确认对话版本，已阻止替换。',
+        refsBlocked: '输入框含 @ 引用，整段替换会丢失引用，已禁用替换；可以复制后手动粘贴。',
+        applying: '正在校验…',
         empty: '输入框里还没有内容。先写一句想做的事，再点改写。',
         tooShort: '至少写 4 个字符再改写。',
         failed: '改写失败',
@@ -52,9 +57,13 @@ window.__ModuleLoader__.load({
         contextMode: 'With conversation',
         fastMode: 'Quick rewrite',
         rewriting: 'Rewriting…',
-        contextStatus: (n) => `Using the last ${n} turn${n === 1 ? '' : 's'}`,
+        contextStatus: (n, truncated) => truncated ? `Using the last ${n} turn${n === 1 ? '' : 's'} (partly trimmed)` : `Using the last ${n} turn${n === 1 ? '' : 's'}`,
         contextEmpty: 'Draft only',
         contextUnavailable: 'Conversation unavailable — draft only',
+        staleVersion: 'The conversation changed (rollback or branch switch); this result is from an older version.',
+        verifyFailed: 'Could not confirm the conversation version; replace is blocked.',
+        refsBlocked: 'The composer contains @ references; replacing the whole draft would drop them, so replace is disabled. Copy instead.',
+        applying: 'Checking…',
         empty: 'The composer is empty. Write one line about what you want, then rewrite.',
         tooShort: 'Write at least 4 characters first.',
         failed: 'Rewrite failed',
@@ -226,15 +235,88 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Re-anchor inline reference chips into rewritten text. Chips have no
+     * textual identity beyond their clipboard projection, so a rewrite only
+     * preserves them when every projection still appears in the new text.
+     * @param text - rewritten draft text.
+     * @param occurrences - chips from the composer's InputState.
+     * @returns reference list, or null when at least one chip would be lost.
+     */
+    function mapReferences(text, occurrences) {
+      const references = []
+      let from = 0
+      for (const occurrence of occurrences) {
+        const token = occurrence && typeof occurrence.clipboardText === 'string' ? occurrence.clipboardText : ''
+        if (token === '') return null
+        /* Models often drop the leading "@" or keep it; accept both spellings
+         * and anchor the chip over the widest span that is actually present. */
+        const bare = token.startsWith('@') ? token.slice(1) : token
+        let at = text.indexOf(token, from)
+        let length = token.length
+        if (at < 0 && bare !== token) {
+          at = text.indexOf(bare, from)
+          if (at >= 0) {
+            if (at > 0 && text[at - 1] === '@') {
+              at -= 1
+              length = token.length
+            } else {
+              length = bare.length
+            }
+          }
+        }
+        if (at < 0) return null
+        const reference = {
+          source: occurrence.source,
+          ref: occurrence.ref,
+          offset: at,
+          length,
+          label: occurrence.label,
+          clipboardText: token,
+        }
+        if (occurrence.appearance !== undefined) reference.appearance = occurrence.appearance
+        references.push(reference)
+        from = at + length
+      }
+      return references
+    }
+
+    /**
+     * Ask the Host whether a result still matches the Session's visible
+     * history. A failure is treated as "not current" so replace stays blocked.
+     * @param sessionId - the Session the result was computed for.
+     * @param version - conversation version returned with that result.
+     * @returns whether the result may still be applied.
+     */
+    async function verifyVersion(sessionId, version) {
+      try {
+        const response = await fetch(VERIFY_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, version }),
+          cache: 'no-store',
+          credentials: 'same-origin',
+        })
+        let data = null
+        try { data = await response.json() } catch { data = null }
+        if (!response.ok) return false
+        return data && data.ok === true && data.match === true
+      } catch {
+        return false
+      }
+    }
+
     /* --------------------------------------------------------------- panel */
 
     function Polisher(props) {
       const draft = props.useInput((state) => state.draft) || ''
+      const occurrences = props.useInput((state) => state.occurrences) || []
       const locale = props.getLocale ? props.getLocale() : 'zh'
       const t = STRINGS[locale] || STRINGS.zh
 
       const [open, setOpen] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
+      const [applying, setApplying] = React.useState(false)
       const [error, setError] = React.useState('')
       const [result, setResult] = React.useState(null)
       const [active, setActive] = React.useState(0)
@@ -243,6 +325,7 @@ window.__ModuleLoader__.load({
       const [toast, setToast] = React.useState('')
       const [hint, setHint] = React.useState('')
       const [mode, setMode] = React.useState('context')
+      const [versionStale, setVersionStale] = React.useState(false)
 
       const rootRef = React.useRef(null)
       const panelRef = React.useRef(null)
@@ -251,6 +334,10 @@ window.__ModuleLoader__.load({
       const lastAutoRef = React.useRef('')
       const toastTimerRef = React.useRef(null)
       const requestRef = React.useRef(0)
+      const draftRef = React.useRef(draft)
+      draftRef.current = draft
+      const sessionRef = React.useRef(props.sessionId)
+      sessionRef.current = props.sessionId
 
       const showToast = React.useCallback((text) => {
         setToast(text)
@@ -278,6 +365,8 @@ window.__ModuleLoader__.load({
         const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
         setMode(nextMode)
         setBusy(true)
+        setApplying(false)
+        setVersionStale(false)
         setError('')
         setHint('')
         try {
@@ -311,10 +400,12 @@ window.__ModuleLoader__.load({
             draft: trimmed,
             variants,
             context: data.context && typeof data.context === 'object' ? data.context : null,
+            version: typeof data.context?.version === 'string' ? data.context.version : '',
             provider: typeof data.provider === 'string' ? data.provider : '',
             model: typeof data.model === 'string' ? data.model : '',
             elapsedMs: typeof data.elapsedMs === 'number' ? data.elapsedMs : 0,
           })
+          setVersionStale(false)
           setActive(0)
           setView('diff')
         } catch (caught) {
@@ -332,7 +423,8 @@ window.__ModuleLoader__.load({
       const stale = result !== null && (
         result.draft !== trimmedDraft ||
         result.sessionId !== sessionId ||
-        result.mode !== mode
+        result.mode !== mode ||
+        versionStale
       )
 
       /* Switching Session or branch invalidates whatever the panel is holding:
@@ -346,6 +438,8 @@ window.__ModuleLoader__.load({
         setResult(null)
         setError('')
         setBusy(false)
+        setApplying(false)
+        setVersionStale(false)
       }, [sessionId])
 
       const toggle = () => {
@@ -439,13 +533,67 @@ window.__ModuleLoader__.load({
         }
       }, [open, busy, error, result, view, active, stale])
 
-      const applyVariant = () => {
-        const variant = result && result.variants[active]
-        if (!variant || stale) return
-        props.inputActions.setDraft(variant.text)
-        if (typeof props.inputActions.persistDraft === 'function') props.inputActions.persistDraft()
-        showToast(t.applied)
-        setOpen(false)
+      /**
+       * Write a draft while keeping its inline chips. The public InputActions
+       * only accept plain text, so resolve the SessionInput facade and hand it
+       * a DraftSnapshot. Any failure falls back to blocking the replace.
+       */
+      const writeWithReferences = (text, references) => {
+        try {
+          const scope = props.api?.sessions?.scope?.(sessionId)
+          const conversation = scope?.get?.('conversation')
+          const input = conversation?.input?.for?.(scope)
+          if (!input || typeof input.setDraft !== 'function') return false
+          input.setDraft({ text, references })
+          if (typeof props.inputActions.persistDraft === 'function') props.inputActions.persistDraft()
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      const applyVariant = async () => {
+        const current = result ? result.variants[Math.min(active, result.variants.length - 1)] : null
+        if (!current || stale || busy || applying) return
+        setApplying(true)
+        setHint('')
+        try {
+          /* Same-session rollback can leave draft, session and mode unchanged,
+           * so the Host's conversation version is the deciding guard. */
+          if (result.version !== '') {
+            const stillCurrent = await verifyVersion(result.sessionId, result.version)
+            if (!stillCurrent) {
+              setVersionStale(true)
+              setHint(t.verifyFailed)
+              return
+            }
+          }
+          if (requestRef.current !== result.requestId || draftRef.current.trim() !== result.draft || (sessionRef.current || '') !== result.sessionId) {
+            setHint(t.stale)
+            return
+          }
+          let references = null
+          if (occurrences.length > 0) {
+            references = mapReferences(current.text, occurrences)
+            if (references === null) {
+              setHint(t.refsBlocked)
+              return
+            }
+          }
+          if (references === null) {
+            props.inputActions.setDraft(current.text)
+            if (typeof props.inputActions.persistDraft === 'function') props.inputActions.persistDraft()
+          } else if (!writeWithReferences(current.text, references)) {
+            setHint(t.refsBlocked)
+            return
+          }
+          showToast(t.applied)
+          setOpen(false)
+        } catch {
+          setHint(t.failed)
+        } finally {
+          setApplying(false)
+        }
       }
 
       const copyVariant = async () => {
@@ -460,6 +608,7 @@ window.__ModuleLoader__.load({
       }
 
       const variant = result ? result.variants[Math.min(active, result.variants.length - 1)] : null
+      const refsLost = variant !== null && occurrences.length > 0 && mapReferences(variant.text, occurrences) === null
 
       const trigger = h('button', {
         type: 'button',
@@ -477,7 +626,7 @@ window.__ModuleLoader__.load({
       const contextLabel = result === null
         ? ''
         : result.context?.status === 'ok'
-          ? t.contextStatus(result.context.turns)
+          ? t.contextStatus(result.context.turns, result.context.truncated === true)
           : result.context?.status === 'unavailable'
             ? t.contextUnavailable
             : t.contextEmpty
@@ -528,9 +677,10 @@ window.__ModuleLoader__.load({
         const rest = notes.filter((note) => !/^待确认[:：]/u.test(note))
         body = h('div', { className: 'pp-result' },
           stale && h('div', { className: 'pp-stale' },
-            h('span', null, t.stale),
+            h('span', null, versionStale ? t.staleVersion : t.stale),
             h('button', { type: 'button', className: 'pp-link', onClick: () => run(draft, mode) }, t.staleAction),
           ),
+          refsLost && h('div', { className: 'pp-refs' }, t.refsBlocked),
           h('div', { className: 'pp-tabs-row' },
             result.variants.length > 1 && h('div', { className: 'pp-tabs' }, tabs),
             h('div', { className: 'pp-views' },
@@ -593,9 +743,10 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'pp-btn pp-btn-primary',
-            disabled: !variant || stale,
+            disabled: !variant || stale || busy || applying || refsLost,
+            title: refsLost ? t.refsBlocked : undefined,
             onClick: applyVariant,
-          }, t.apply),
+          }, applying ? t.applying : t.apply),
         ),
       )
 
@@ -710,6 +861,7 @@ window.__ModuleLoader__.load({
 .pp-error-body { color: var(--dsw-alias-label-dimmed, #8a9099); word-break: break-word; }
 .pp-result { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
 .pp-stale { margin: 8px 12px 0; padding: 6px 8px; border-radius: 7px; background: color-mix(in srgb, var(--dsw-alias-accent, #e6a23c) 14%, transparent); color: var(--dsw-alias-label-dimmed, #8a9099); display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.pp-refs { margin: 8px 12px 0; padding: 6px 8px; border-radius: 7px; background: color-mix(in srgb, var(--dsw-alias-danger, #e06c75) 10%, transparent); color: var(--dsw-alias-label-dimmed, #8a9099); font-size: 11px; line-height: 1.45; }
 .pp-tabs-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px 0; }
 .pp-tabs { display: flex; gap: 2px; flex-wrap: wrap; padding: 2px; border-radius: 9px; background: color-mix(in srgb, var(--dsw-alias-bg-layer-2, #eef0f3) 70%, transparent); }
 .pp-tab { border: 0; background: transparent; color: var(--dsw-alias-label-dimmed, #8a9099); padding: 4px 10px; border-radius: 7px; font-size: 11px; cursor: pointer; transition: background .12s, color .12s; }
@@ -796,7 +948,7 @@ window.__ModuleLoader__.load({
 `
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'sessions'],
       apply(ctx) {
         const getLocale = () => {
           try {
@@ -811,7 +963,7 @@ window.__ModuleLoader__.load({
           id: 'prompt-polisher',
           order: 30,
           label: 'Polish prompt',
-          inject: (sessionId) => ({ getLocale, sessionId }),
+          inject: (sessionId) => ({ getLocale, sessionId, api: ctx }),
         }, Polisher)), 'prompt-polisher: composer entry')
       },
     }

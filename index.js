@@ -1,21 +1,23 @@
 /**
  * prompt-polisher — Host half.
  *
- * The Browser half cannot call Host services directly, so this half exposes two
+ * The Browser half cannot call Host services directly, so this half exposes
  * exact routes on the deployment's own web server:
  *
  *   GET  /dsh-prompt-polisher/health   — liveness probe for curl / diagnostics
- *   POST /dsh-prompt-polisher/rewrite  — { draft, locale } -> three variants
+ *   POST /dsh-prompt-polisher/rewrite  — { draft, locale, mode, sessionId } -> variants
+ *   POST /dsh-prompt-polisher/verify   — { sessionId, version } -> history still current?
  *
  * The rewrite runs through the deployment's own LLM service with the model the
  * user already selected (`agentDefaultModel.currentSelection()`), so no extra
- * key, base URL or provider configuration is involved. Responses are strict
- * JSON; the model is asked for one JSON object and a non-JSON answer is folded
- * into a single fallback variant rather than surfacing a 500.
+ * key, base URL or provider configuration is involved. Answers must be strict
+ * JSON: a truncated or unparseable generation is reported as a retryable error
+ * so it can never overwrite the user's draft.
  */
 
 const ROUTE_HEALTH = '/dsh-prompt-polisher/health'
 const ROUTE_REWRITE = '/dsh-prompt-polisher/rewrite'
+const ROUTE_VERIFY = '/dsh-prompt-polisher/verify'
 
 const MAX_BODY_BYTES = 256 * 1024
 const MAX_DRAFT_CHARS = 12_000
@@ -23,9 +25,13 @@ const MIN_DRAFT_CHARS = 4
 const REQUEST_TIMEOUT_MS = 180_000
 
 /** Context mode: how much visible conversation is handed to the model. */
-const CONTEXT_TURNS = 4
+const CONTEXT_TURNS = 6
 const CONTEXT_CHAR_BUDGET = 7000
-const MAX_CONTEXT_ITEM_CHARS = 2400
+const MAX_PROMPT_CHARS = 3000
+const MAX_ANSWER_CHARS = 2600
+const ANSWER_HEAD_CHARS = 520
+const ANSWER_TAIL_CHARS = 1000
+const ANSWER_PLAN_CHARS = 780
 
 /** Lowest-to-highest reasoning ids, used to clamp the selected effort to what a model offers. */
 const REASONING_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
@@ -88,9 +94,17 @@ export function apply(ctx) {
           void handleRewrite(scoped, request, response)
         },
       })
+      const offVerify = scoped.webServer.register({
+        kind: 'exact',
+        path: ROUTE_VERIFY,
+        handler: (request, response) => {
+          void handleVerify(scoped, request, response)
+        },
+      })
       return () => {
         offHealth()
         offRewrite()
+        offVerify()
       }
     }, 'prompt-polisher: rewrite route')
   })
@@ -103,46 +117,67 @@ export function apply(ctx) {
  * @param response - Node's ServerResponse; this handler owns its lifecycle.
  */
 async function handleRewrite(ctx, request, response) {
+  if (request.method !== 'POST') {
+    response.writeHead(405, { allow: 'POST' })
+    response.end()
+    return
+  }
+  if (admitRequest(ctx, request, response) === null) return
+  let body
   try {
-    if (request.method !== 'POST') {
-      response.writeHead(405, { allow: 'POST' })
-      response.end()
-      return
-    }
-    if (!sameOrigin(request)) {
-      sendJson(response, 403, { ok: false, error: 'untrusted origin' })
-      return
-    }
-    let body
-    try {
-      body = JSON.parse(await readBody(request))
-    } catch (error) {
-      sendJson(response, 400, { ok: false, error: `bad request body: ${messageOf(error)}` })
-      return
-    }
-    const draft = typeof body?.draft === 'string' ? body.draft.trim() : ''
-    if (draft.length < MIN_DRAFT_CHARS) {
-      sendJson(response, 400, { ok: false, error: 'draft is too short' })
-      return
-    }
-    if (draft.length > MAX_DRAFT_CHARS) {
-      sendJson(response, 413, { ok: false, error: `draft is longer than ${MAX_DRAFT_CHARS} characters` })
-      return
-    }
-    const startedAt = Date.now()
-    const locale = body?.locale === 'en' ? 'en' : 'zh'
-    const mode = body?.mode === 'fast' ? 'fast' : 'context'
-    const reportedSessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
-    /* The routing header still needs a non-empty id for some providers; history
-     * lookup must use the real Session id only, never the synthetic fallback. */
-    const routingSessionId = reportedSessionId === '' ? 'plugin:dsh-prompt-polisher' : reportedSessionId
-    const conversation = mode === 'context'
-      ? readConversation(ctx, reportedSessionId)
-      : { status: 'off', items: [], turns: 0, chars: 0 }
-    const context = conversation.status === 'ok'
-      ? { status: 'ok', turns: conversation.turns, chars: conversation.chars, label: `已参考最近 ${conversation.turns} 轮` }
-      : { status: conversation.status, turns: 0, chars: 0 }
-    const outcome = await rewriteDraft(ctx, draft, locale, routingSessionId, { mode, conversation })
+    body = JSON.parse(await readBody(request))
+  } catch (error) {
+    sendJson(response, 400, { ok: false, error: `bad request body: ${messageOf(error)}` })
+    return
+  }
+  const draft = typeof body?.draft === 'string' ? body.draft.trim() : ''
+  if (draft.length < MIN_DRAFT_CHARS) {
+    sendJson(response, 400, { ok: false, error: 'draft is too short' })
+    return
+  }
+  if (draft.length > MAX_DRAFT_CHARS) {
+    sendJson(response, 413, { ok: false, error: `draft is longer than ${MAX_DRAFT_CHARS} characters` })
+    return
+  }
+  const reportedSessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+  /* The browser-supplied id is only a locator. Admission above proves the
+   * caller may use this Host; the store lookup below proves the Session exists
+   * here, so a forged or stale id cannot address arbitrary history. */
+  const session = lookupSession(ctx, reportedSessionId)
+  if (reportedSessionId !== '' && session === undefined) {
+    sendJson(response, 404, { ok: false, error: 'session not found' })
+    return
+  }
+  const startedAt = Date.now()
+  const locale = body?.locale === 'en' ? 'en' : 'zh'
+  const mode = body?.mode === 'fast' ? 'fast' : 'context'
+  /* Providers such as OpenCode require a routing header; fall back to a
+   * synthetic id only for that header, never for history lookup. */
+  const routingSessionId = reportedSessionId === '' ? 'plugin:dsh-prompt-polisher' : reportedSessionId
+  const conversation = mode === 'context'
+    ? readConversation(session)
+    : { status: 'off', items: [], turns: 0, chars: 0, truncated: false, version: '' }
+  const context = conversation.status === 'ok'
+    ? {
+        status: 'ok',
+        turns: conversation.turns,
+        chars: conversation.chars,
+        truncated: conversation.truncated === true,
+        version: conversation.version,
+      }
+    : { status: conversation.status, turns: 0, chars: 0, truncated: false, version: conversation.version ?? '' }
+  const controller = new AbortController()
+  const onClose = () => {
+    if (!response.writableEnded) controller.abort()
+  }
+  response.on('close', onClose)
+  try {
+    const outcome = await rewriteDraft(ctx, draft, locale, routingSessionId, {
+      mode,
+      conversation,
+      signal: controller.signal,
+    })
+    if (response.writableEnded || response.destroyed) return
     sendJson(response, 200, {
       ok: true,
       mode,
@@ -154,13 +189,46 @@ async function handleRewrite(ctx, request, response) {
       elapsedMs: Date.now() - startedAt,
     })
   } catch (error) {
+    if (response.writableEnded || response.destroyed) return
+    if (error instanceof Error && error.name === 'AbortError') return
     const status = Number.isInteger(error?.status) ? error.status : 500
-    try {
-      sendJson(response, status, { ok: false, error: messageOf(error) })
-    } catch {
-      response.destroy()
-    }
+    sendJson(response, status, { ok: false, error: messageOf(error) })
+  } finally {
+    response.off('close', onClose)
   }
+}
+
+/**
+ * Verify that a panel result still matches the Session's visible history.
+ * Rollback and branch switches bump the Session sequence, so a result carrying
+ * an older version must not replace the composer draft.
+ * @param ctx - plugin context.
+ * @param request - Node's IncomingMessage.
+ * @param response - Node's ServerResponse.
+ */
+async function handleVerify(ctx, request, response) {
+  if (request.method !== 'POST') {
+    response.writeHead(405, { allow: 'POST' })
+    response.end()
+    return
+  }
+  if (admitRequest(ctx, request, response) === null) return
+  let body
+  try {
+    body = JSON.parse(await readBody(request))
+  } catch (error) {
+    sendJson(response, 400, { ok: false, error: `bad request body: ${messageOf(error)}` })
+    return
+  }
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+  const expected = typeof body?.version === 'string' ? body.version : ''
+  const session = lookupSession(ctx, sessionId)
+  if (session === undefined) {
+    sendJson(response, 404, { ok: false, error: 'session not found' })
+    return
+  }
+  const current = conversationVersion(session)
+  sendJson(response, 200, { ok: true, current, match: versionMatches(session, expected) })
 }
 
 /**
@@ -193,7 +261,16 @@ async function rewriteDraft(ctx, draft, locale, sessionId, options) {
   const blocks = new Map()
   let finish
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  let timedOut = false
+  const onAbort = () => controller.abort()
+  if (options?.signal !== undefined) {
+    if (options.signal.aborted) controller.abort()
+    else options.signal.addEventListener('abort', onAbort, { once: true })
+  }
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
   try {
     for await (const chunk of llm.stream({
       provider: selection.provider,
@@ -216,15 +293,27 @@ async function rewriteDraft(ctx, draft, locale, sessionId, options) {
     }
   } catch (error) {
     if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
-      throw httpError(504, `the model did not answer within ${REQUEST_TIMEOUT_MS / 1000}s`)
+      /* A timeout answers 504; a client disconnect stays an AbortError so the
+       * route can drop the response without writing to a dead socket. */
+      if (timedOut) throw httpError(504, `the model did not answer within ${REQUEST_TIMEOUT_MS / 1000}s`)
+      throw error
     }
     throw error
   } finally {
     clearTimeout(timer)
+    if (options?.signal !== undefined) options.signal.removeEventListener('abort', onAbort)
   }
-  if (finish?.kind === 'aborted') throw httpError(504, 'rewrite was aborted')
+  if (finish?.kind === 'aborted') {
+    if (timedOut) throw httpError(504, 'the rewrite timed out')
+    throw Object.assign(new Error('the rewrite was aborted'), { name: 'AbortError' })
+  }
   if (finish?.kind === 'error') {
     throw httpError(502, `provider error: ${messageOf(finish.failure)}`)
+  }
+  /* A truncated answer is not a usable variant: the JSON is cut mid-object and
+   * would otherwise be presented as a half-written prompt. */
+  if (finish?.kind === 'max-tokens') {
+    throw httpError(502, 'the model output was truncated (max tokens); try again')
   }
   const text = [...blocks.entries()]
     .sort((a, b) => a[0] - b[0])
@@ -281,19 +370,12 @@ async function pickEffort(llm, selection) {
  * assistant answer text are used; tool traffic and system-scaffold messages are
  * skipped, and the surface order is the model-visible order. A missing Session,
  * an unreadable store and an empty surface all degrade to draft-only rewriting.
- * @param ctx - plugin context with the sessions service available.
- * @param sessionId - the Session id reported by the composer (a locator only).
- * @returns {{ status: 'ok'|'unavailable'|'empty', items: {role:'user'|'assistant', text:string}[], turns: number, chars: number }}
+ * @param session - the resolved Session, or undefined when none was named.
+ * @returns {{ status: 'ok'|'unavailable'|'empty', items: {role:'user'|'assistant', text:string}[], turns: number, chars: number, truncated: boolean, version: string }}
  */
-function readConversation(ctx, sessionId) {
-  if (sessionId === '') return { status: 'unavailable', items: [], turns: 0, chars: 0 }
-  let session
-  try {
-    session = ctx.get('sessions')?.get?.(sessionId)
-  } catch {
-    session = undefined
-  }
-  if (!session) return { status: 'unavailable', items: [], turns: 0, chars: 0 }
+function readConversation(session) {
+  if (!session) return { status: 'unavailable', items: [], turns: 0, chars: 0, truncated: false, version: '' }
+  const version = conversationVersion(session)
   let nodes = []
   try {
     nodes = Array.from(session.surface?.nodes ?? [])
@@ -331,30 +413,204 @@ function readConversation(ctx, sessionId) {
       if (text !== '') current.answers.push(text)
     }
   }
-  if (turns.length === 0) return { status: 'empty', items: [], turns: 0, chars: 0 }
+  if (turns.length === 0) return { status: 'empty', items: [], turns: 0, chars: 0, truncated: false, version }
   const recent = turns.slice(-CONTEXT_TURNS)
-  const items = []
-  for (const turn of recent) {
-    items.push({ role: 'user', text: truncate(turn.prompt, MAX_CONTEXT_ITEM_CHARS) })
-    for (const answer of turn.answers) {
-      items.push({ role: 'assistant', text: truncate(answer, MAX_CONTEXT_ITEM_CHARS) })
-    }
-  }
-  /* Budget from the newest turn backwards, so the exchange right before the
-   * draft survives even when the budget is tight. */
   const kept = []
   let chars = 0
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index]
-    if (kept.length > 0 && chars + item.text.length > CONTEXT_CHAR_BUDGET) break
-    kept.push(item)
-    chars += item.text.length
+  let truncated = kept.length < recent.length
+  /* Newest turn first: if the budget runs out, older history is what gets
+   * dropped. Within a turn the user's question is reserved before its answer,
+   * so one long answer can never push out the prompt that asked it. */
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const turn = recent[index]
+    const room = CONTEXT_CHAR_BUDGET - chars
+    if (room < 160) {
+      truncated = true
+      break
+    }
+    const prompt = truncate(turn.prompt, MAX_PROMPT_CHARS)
+    if (prompt.length < turn.prompt.length) truncated = true
+    const keepPrompt = truncate(prompt, Math.max(80, Math.min(prompt.length, Math.floor(room * 0.6))))
+    if (keepPrompt.length < prompt.length) truncated = true
+    let answer = ''
+    const answerRaw = turn.answers.join('\n\n')
+    const answerRoom = room - keepPrompt.length - 12
+    if (answerRaw !== '' && answerRoom >= 200) {
+      const compressed = compressAnswer(answerRaw, Math.min(MAX_ANSWER_CHARS, answerRoom))
+      answer = compressed.text
+      if (compressed.truncated) truncated = true
+    } else if (answerRaw !== '') {
+      truncated = true
+    }
+    kept.unshift({ prompt: keepPrompt, answer })
+    chars += keepPrompt.length + answer.length
   }
-  kept.reverse()
-  if (!kept.some((item) => item.role === 'user')) return { status: 'empty', items: [], turns: 0, chars: 0 }
-  let usedTurns = 0
-  for (const item of kept) if (item.role === 'user') usedTurns += 1
-  return { status: 'ok', items: kept, turns: usedTurns, chars }
+  if (kept.length === 0) {
+    return { status: 'empty', items: [], turns: 0, chars: 0, truncated: true, version }
+  }
+  if (kept.length < recent.length) truncated = true
+  const items = []
+  for (const turn of kept) {
+    items.push({ role: 'user', text: turn.prompt })
+    if (turn.answer !== '') items.push({ role: 'assistant', text: turn.answer })
+  }
+  return { status: 'ok', items, turns: kept.length, chars, truncated, version }
+}
+
+/**
+ * Compress one long answer for the context window without losing the two parts
+ * that later turns cite: a plan/constraint list and the closing conclusion.
+ * @param text - full answer text.
+ * @param max - character budget for this answer.
+ * @returns the compressed text and whether anything was dropped.
+ */
+function compressAnswer(text, max) {
+  if (text.length <= max) return { text, truncated: false }
+  const headLen = Math.min(ANSWER_HEAD_CHARS, Math.floor(max * 0.25))
+  const tailLen = Math.min(ANSWER_TAIL_CHARS, Math.floor(max * 0.42))
+  const head = text.slice(0, headLen).trim()
+  const tail = text.slice(-tailLen).trim()
+  const planRoom = Math.max(0, max - headLen - tailLen - 24)
+  const plans = extractPlanLines(text).join('\n').slice(0, Math.min(ANSWER_PLAN_CHARS, planRoom)).trim()
+  const assembled = [head, plans, tail].filter((part) => part !== '').join('\n…\n')
+  if (assembled.length <= max) return { text: assembled, truncated: true }
+  const withoutPlans = [head, tail].filter((part) => part !== '').join('\n…\n')
+  return { text: withoutPlans.slice(0, max), truncated: true }
+}
+
+/**
+ * Lines that carry a plan, a constraint or a section header — the parts a later
+ * "按第二种" refers to even when they sit at the end of a long answer.
+ * @param text - full answer text.
+ * @returns the distinct matching lines, in document order.
+ */
+function extractPlanLines(text) {
+  const seen = new Set()
+  const lines = []
+  let size = 0
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (line === '' || !isPlanLine(line) || seen.has(line)) continue
+    seen.add(line)
+    lines.push(line)
+    size += line.length + 1
+    if (size >= ANSWER_PLAN_CHARS) break
+  }
+  return lines
+}
+
+/**
+ * Whether one line looks like a list item, a numbered step, a named option or a
+ * labeled section worth keeping when an answer is compressed.
+ * @param line - trimmed line.
+ * @returns true for plan-like lines.
+ */
+function isPlanLine(line) {
+  return /^(?:[-*•·]|\d+[.)、]|[一二三四五六七八九十]+[、.]|方案\s*[一二三四五六七八九十\d]+|第[一二三四五六七八九十\d]+(?:种|个|步|条|版))/u.test(line)
+    || /(?:方案|步骤|验收|交付|约束|目标|范围)[:：]/u.test(line)
+}
+
+/**
+ * FNV-1a over the first `count` surface node ids.
+ * @param nodes - surface node seq ids, in model order.
+ * @param count - how many leading nodes to hash.
+ * @returns unsigned hash.
+ */
+function nodeHash(nodes, count) {
+  let hash = 2166136261
+  for (let index = 0; index < count; index += 1) {
+    hash ^= Number(nodes[index]) | 0
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
+/**
+ * Fingerprint of the Session's visible history at the start of a request.
+ * Verification later compares this as a *prefix*: appending new nodes (the
+ * agent keeps working) does not invalidate an answer, while a rollback or
+ * branch switch that rewrites the prefix does.
+ * @param session - a Session from the sessions service.
+ * @returns a short opaque version string.
+ */
+function conversationVersion(session) {
+  let nodes = []
+  try {
+    nodes = Array.from(session.surface?.nodes ?? [])
+  } catch {
+    nodes = []
+  }
+  /* Session.seq advances on every event, including tool traffic that never
+   * reaches the visible surface. Versioning on seq would invalidate a result
+   * whenever the agent runs a tool; only the surface node list describes the
+   * history the next prompt would actually see. */
+  return `${nodes.length}:${nodeHash(nodes, nodes.length).toString(36)}`
+}
+
+/**
+ * Whether the current surface still starts with the recorded nodes.
+ * @param session - the Session right now.
+ * @param expected - version string produced by conversationVersion.
+ * @returns true when nothing before the recorded point changed.
+ */
+function versionMatches(session, expected) {
+  if (expected === '') return true
+  const separator = expected.indexOf(':')
+  if (separator <= 0) return false
+  const count = Number(expected.slice(0, separator))
+  if (!Number.isInteger(count) || count < 0) return false
+  let nodes = []
+  try {
+    nodes = Array.from(session.surface?.nodes ?? [])
+  } catch {
+    return false
+  }
+  if (nodes.length < count) return false
+  return nodeHash(nodes, count).toString(36) === expected.slice(separator + 1)
+}
+
+/**
+ * Resolve the Session a request names. The id is untrusted input; only a
+ * Session that exists in this Host may be read.
+ * @param ctx - plugin context.
+ * @param sessionId - id supplied by the browser.
+ * @returns the Session or undefined.
+ */
+function lookupSession(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  try {
+    return ctx.get('sessions')?.get?.(sessionId)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Admit one request through the deployment's own connection fence. Browser
+ * requests carry the DSH session cookie; non-browser callers are refused.
+ * @param ctx - plugin context.
+ * @param request - Node's IncomingMessage.
+ * @param response - Node's ServerResponse.
+ * @returns the peer, or null when a rejection response was already sent.
+ */
+function admitRequest(ctx, request, response) {
+  const connection = ctx.get('connection')
+  if (connection === undefined || typeof connection.admit !== 'function') {
+    sendJson(response, 503, { ok: false, error: 'connection service is unavailable' })
+    return null
+  }
+  let admission
+  try {
+    admission = connection.admit(request)
+  } catch {
+    admission = { rejection: 401 }
+  }
+  if (admission !== null && typeof admission === 'object' && 'rejection' in admission) {
+    const status = admission.rejection === 403 ? 403 : 401
+    sendJson(response, status, { ok: false, error: status === 403 ? 'forbidden' : 'authentication required' })
+    return null
+  }
+  return admission?.peer ?? {}
 }
 
 /**
@@ -386,8 +642,9 @@ function buildContextUser(draft, locale, conversation) {
 }
 
 /**
- * Turn the model answer into variants. A fenced or chatty answer is repaired
- * where possible; an unparseable one becomes a single variant instead of a 502.
+ * Turn the model answer into variants. Fenced or chatty answers are repaired
+ * where possible; an unparseable answer is a failed generation (502) rather
+ * than a raw JSON blob shown as if it were a prompt.
  */
 function parseVariants(raw) {
   const cleaned = stripFence(raw).trim()
@@ -417,7 +674,9 @@ function parseVariants(raw) {
   }
   if (variants.length === 0) {
     if (cleaned === '') throw httpError(502, 'the model returned an empty answer')
-    variants.push({ id: 'rewrite', label: '改写', text: cleaned, notes: [] })
+    /* A half-written or non-JSON answer is a failed generation, not a prompt:
+     * surfacing its raw text as a variant would hand the user broken JSON. */
+    throw httpError(502, 'the model returned invalid JSON; try again')
   }
   return variants
 }
