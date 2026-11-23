@@ -1,0 +1,25 @@
+# dependencies / build output
+node_modules/
+dist/
+build/
+coverage/
+
+# local screenshots & docs artifacts
+docs/
+screenshots/
+*.shot.png
+
+# logs, temp files, caches
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+.cache/
+
+# local test / debug outputs
+pp-*.json
+*-test.json
+*.test-output.*
